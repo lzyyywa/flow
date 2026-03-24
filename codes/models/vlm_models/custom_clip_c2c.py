@@ -31,7 +31,6 @@ class FlowMLP(nn.Module):
         )
 
     def forward(self, x, t):
-        # 直接将时间标量 t 拼接到特征 x 的末尾
         x_t = torch.cat([x, t], dim=-1) 
         return self.net(x_t)
 
@@ -162,7 +161,6 @@ class VideoEncoder(nn.Module):
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
-        
         self.verb_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'verb')
         self.verb_tokenized_prompts = self.verb_prompt_learner.token_ids
         self.obj_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'object')
@@ -172,7 +170,6 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
 
-        # ======== C2C part =====
         try:
             fc_emb = cfg.fc_emb.split(',')
         except:
@@ -197,20 +194,14 @@ class CustomCLIP(nn.Module):
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        # =========================================================
-        # === FlowComposer Initialization ===
-        # =========================================================
         self.use_flow = getattr(cfg, 'use_flow', False)
         if self.use_flow:
-            self.flow_step = getattr(cfg, 'flow_step_size', 0.1)
-            # Flow Models & Composer 严格在 300 维空间工作
             self.v_flow = FlowMLP(cfg.emb_dim)
             self.o_flow = FlowMLP(cfg.emb_dim)
             self.composer = FlowComposer(cfg.emb_dim)
 
 
     def forward(self, video, pairs=None, verb_labels=None, obj_labels=None):
-        # Text feature extraction
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
         verb_text_features = self.c2c_text_v(verb_text_features)
@@ -219,17 +210,12 @@ class CustomCLIP(nn.Module):
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
         obj_text_features = self.c2c_text_o(obj_text_features)
 
-        # Video feature extraction
         video_features = self.video_encoder(video) 
 
-        # Independent learning (Base disentangled visual features)
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))  
         v_feat_t = self.c2c_VE1(video_features)             
         v_feat = v_feat_t.mean(dim=-1)                      
 
-        # =========================================================
-        # === 1. Original Vanilla Logic Branch ===
-        # =========================================================
         if not self.use_flow:
             o_feat_normed = F.normalize(o_feat, dim=1)
             v_feat_normed = F.normalize(v_feat, dim=1)
@@ -263,18 +249,13 @@ class CustomCLIP(nn.Module):
                 com_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
                 return com_logits
 
-        # =========================================================
-        # === 2. FlowComposer Plugin Branch ===
-        # =========================================================
         else:
             B, D = v_feat.shape
             device = video.device
 
-            # Define endpoints (Visual space x_0)
             x0_v = v_feat
             x0_o = o_feat
             
-            # 使用条件特征叠加构建完全解耦、维度对齐且不破坏语义的全局视觉特征起点
             o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
             v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
             x0_c = v_feat_c + o_feat_c
@@ -283,14 +264,10 @@ class CustomCLIP(nn.Module):
                 if verb_labels is None or obj_labels is None:
                     raise ValueError("Flow training requires `verb_labels` and `obj_labels` in the forward pass.")
 
-                # Target text embeddings (Text space x_1)
                 target_x1_v = verb_text_features[verb_labels]
                 target_x1_o = obj_text_features[obj_labels]
-                
-                # 直接通过向量叠加得到真实的组合文本终点，极强保护 Zero-Shot 空间！
                 target_x1_c = target_x1_v + target_x1_o
 
-                # Step 1: Primitive Flows Module
                 t = torch.rand(B, 1, device=device)
                 xt_v = (1 - t) * x0_v + t * target_x1_v
                 xt_o = (1 - t) * x0_o + t * target_x1_o
@@ -301,7 +278,6 @@ class CustomCLIP(nn.Module):
                 pred_x1_v = xt_v + (1 - t) * pred_v_v
                 pred_x1_o = xt_o + (1 - t) * pred_v_o
 
-                # Step 2: Leakage-Guided Augmentation Module
                 xt_v_leak = (1 - t) * x0_o + t * target_x1_v  
                 xt_o_leak = (1 - t) * x0_v + t * target_x1_o  
                 
@@ -311,16 +287,14 @@ class CustomCLIP(nn.Module):
                 pred_x1_v_leak = xt_v_leak + (1 - t) * pred_v_v_leak
                 pred_x1_o_leak = xt_o_leak + (1 - t) * pred_v_o_leak
 
-                # Step 3: Composer Module
                 norm_v_v = F.normalize(pred_v_v, dim=-1)
                 norm_v_o = F.normalize(pred_v_o, dim=-1)
                 pred_a, pred_b = self.composer(norm_v_v, norm_v_o)
 
-                # Predict explicit composition endpoint
                 pred_v_c = pred_a * norm_v_v + pred_b * norm_v_o
-                pred_x1_c = x0_c + self.flow_step * pred_v_c
+                # 【神坑修复2】彻底抛弃 0.1 步长，训练必须使用 1.0 全步长到达端点算分类！
+                pred_x1_c = x0_c + 1.0 * pred_v_c
                 
-                # Logits Calculation (供交叉熵损失使用)
                 pred_x1_v_norm = F.normalize(pred_x1_v, dim=-1)
                 pred_x1_o_norm = F.normalize(pred_x1_o, dim=-1)
                 verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
@@ -360,7 +334,6 @@ class CustomCLIP(nn.Module):
                 }
 
             else:
-                # Flow Composer Inference
                 t_zero = torch.zeros(B, 1, device=device)
                 
                 pred_v_v = self.v_flow(x0_v, t_zero)
@@ -371,7 +344,9 @@ class CustomCLIP(nn.Module):
                 pred_a, pred_b = self.composer(norm_v_v, norm_v_o)
                 
                 pred_v_c = pred_a * norm_v_v + pred_b * norm_v_o
-                pred_x1_c = x0_c + self.flow_step * pred_v_c
+                
+                # 【神坑修复2】因为代码里不写 ODE 积分 Loop (For 循环)，这里也必须是 1.0 直接推过去
+                pred_x1_c = x0_c + 1.0 * pred_v_c
                 
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
                 pair_verb_text = verb_text_features[verb_idx]
