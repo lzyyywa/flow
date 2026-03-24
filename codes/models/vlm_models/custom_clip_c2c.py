@@ -339,23 +339,45 @@ class CustomCLIP(nn.Module):
                 # Predict explicit composition endpoint
                 pred_v_c = pred_a * norm_v_v + pred_b * norm_v_o
                 pred_x1_c = x0_c + self.flow_step * pred_v_c
+                
+                # =================================================================
+                # === 新增：用到达终点的特征与文本特征算相似度，生成 CE Loss 所需的 Logits ===
+                # =================================================================
+                pred_x1_v_norm = F.normalize(pred_x1_v, dim=-1)
+                pred_x1_o_norm = F.normalize(pred_x1_o, dim=-1)
+                verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
+                obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
+                
+                logits_v = pred_x1_v_norm @ verb_text_features_norm.t()
+                logits_o = pred_x1_o_norm @ obj_text_features_norm.t()
+                
+                # 按照 Vanilla 原有逻辑进行 Scale 对齐
+                logits_v = logits_v * 0.5 + 0.5
+                logits_o = logits_o * 0.5 + 0.5
+                
+                logits_c = None
+                if pairs is not None:
+                    train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
+                    pair_verb_text = verb_text_features[train_v_inds]
+                    pair_obj_text = obj_text_features[train_o_inds]
+                    train_pair_text_features = self.action_text_fusion(torch.cat([pair_verb_text, pair_obj_text], dim=-1))
+                    
+                    pred_x1_c_norm = F.normalize(pred_x1_c, dim=-1)
+                    train_pair_text_features_norm = F.normalize(train_pair_text_features, dim=-1)
+                    # 组合特征的 Logits (用于组合动作的 CE Loss)
+                    logits_c = pred_x1_c_norm @ train_pair_text_features_norm.t()
 
-                # Return dictionary for loss calculation in train_models.py
+                # 把 logits 一并塞进返回字典里
                 return {
-                    # For CE Loss (Standard endpoints)
+                    "logits_v": logits_v, "logits_o": logits_o, "logits_c": logits_c,
                     "pred_x1_v": pred_x1_v, "pred_x1_o": pred_x1_o, "pred_x1_c": pred_x1_c,
-                    # For CE Loss (Leakage endpoints)
                     "pred_x1_v_leak": pred_x1_v_leak, "pred_x1_o_leak": pred_x1_o_leak,
-                    # For MSE Loss (Standard flow)
                     "pred_v_v": pred_v_v, "pred_v_o": pred_v_o,
                     "true_v_v": target_x1_v - x0_v, "true_v_o": target_x1_o - x0_o,
-                    # For MSE Loss (Leakage flow)
                     "pred_v_v_leak": pred_v_v_leak, "pred_v_o_leak": pred_v_o_leak,
                     "true_v_v_leak": target_x1_v - x0_o, "true_v_o_leak": target_x1_o - x0_v,
-                    # For Composer LSTSQ Loss
                     "pred_a": pred_a, "pred_b": pred_b,
                     "norm_v_v": norm_v_v, "norm_v_o": norm_v_o, "true_v_c": target_x1_c - x0_c,
-                    # Required references
                     "verb_text_features": verb_text_features, "obj_text_features": obj_text_features, "logit_scale": self.logit_scale
                 }
 
