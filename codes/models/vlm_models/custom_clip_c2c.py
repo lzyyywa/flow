@@ -32,8 +32,9 @@ class FlowMLP(nn.Module):
 
     def forward(self, x, t):
         # x: [B, D], t: [B, 1]
-        t_embed = t.expand(-1, x.shape[1]) if t.dim() == 2 else t
-        x_t = torch.cat([x, t_embed], dim=-1)
+        # 直接将时间标量 t 拼接到特征 x 的末尾，不需要 expand
+        # x_t 的维度将变为 [B, D + 1] (即 301 维)
+        x_t = torch.cat([x, t], dim=-1) 
         return self.net(x_t)
 
 class FlowComposer(nn.Module):
