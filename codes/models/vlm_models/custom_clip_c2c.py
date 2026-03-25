@@ -298,20 +298,9 @@ class CustomCLIP(nn.Module):
                 if pairs is not None:
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
                     
-                    # 1. 拿回纯净版 C2C 的条件概率图得分 (极其稳固的基线)
                     c2c_graph_logits = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
-
-                    # 2. 获取 FlowComposer 的空间测量得分
-                    pair_verb_text = verb_text_features_norm[train_v_inds]
-                    pair_obj_text = obj_text_features_norm[train_o_inds]
-                    train_pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
                     
-                    pred_x1_c_norm = F.normalize(pred_x1_c_0, dim=-1)
-                    flow_explicit_logits = pred_x1_c_norm @ train_pair_text_features.t()
-                    flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
-                    
-                    # 3. 完美结合！
-                    logits_c = c2c_graph_logits + 0.5 * flow_explicit_logits
+                    logits_c = c2c_graph_logits
 
                 return {
                     # 【这里的返回至关重要】必须返回 base 版本的 logits 给 Loss_fn！
