@@ -225,12 +225,13 @@ class CustomCLIP(nn.Module):
                 return com_logits
 
         # =========================================================
-        # === FlowComposer Plugin Branch (The True Marriage!) ===
+        # === FlowComposer Plugin Branch (The True Two-Stream!) ===
         # =========================================================
         else:
             B, D = v_feat.shape
             device = video.device
 
+            # 1. 所有起点严格 L2 归一化
             x0_v = F.normalize(v_feat, dim=-1)
             x0_o = F.normalize(o_feat, dim=-1)
             
@@ -241,6 +242,25 @@ class CustomCLIP(nn.Module):
             verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
             obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
 
+            # -------------------------------------------------------------
+            # 🔥 主路：纯净 C2C 保底逻辑 (100% 原汁原味，防止地基坍塌)
+            # -------------------------------------------------------------
+            # 绝对不能用 Flow 的特征算这里的基础 logits，必须用纯净的 x0_v 和 x0_o
+            logits_v_base = x0_v @ verb_text_features_norm.t()
+            logits_o_base = x0_o @ obj_text_features_norm.t()
+            
+            logits_v_base = logits_v_base * 0.5 + 0.5
+            logits_o_base = logits_o_base * 0.5 + 0.5
+            
+            c = verb_text_features.shape[-1]
+            n_v = logits_v_base.shape[-1]
+            n_o = logits_o_base.shape[-1]
+
+            # 喂给图大脑的一定要是纯净的视觉打分！
+            p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, B, c, n_v)
+            p_pair_o = p_v_con_o * logits_o_base.unsqueeze(1)
+            p_pair_v = p_o_con_v * logits_v_base.unsqueeze(-1)
+
             if self.training:
                 if verb_labels is None or obj_labels is None:
                     raise ValueError("Flow training requires `verb_labels` and `obj_labels`.")
@@ -248,7 +268,7 @@ class CustomCLIP(nn.Module):
                 target_x1_v = verb_text_features_norm[verb_labels]
                 target_x1_o = obj_text_features_norm[obj_labels]
 
-                # --- 轨迹约束：计算流的 MSE Loss ---
+                # --- 辅路 A：流匹配 MSE 轨迹训练 ---
                 t = torch.rand(B, 1, device=device)
                 xt_v = (1 - t) * x0_v + t * target_x1_v
                 xt_o = (1 - t) * x0_o + t * target_x1_o
@@ -262,14 +282,10 @@ class CustomCLIP(nn.Module):
                 pred_v_v_leak_t = self.v_flow(xt_v_leak, t)
                 pred_v_o_leak_t = self.o_flow(xt_o_leak, t)
 
-                # --- 零样本分类：1.0 步长直达终点 ---
+                # --- 辅路 B：FlowComposer 辅助打分 ---
                 t_zero = torch.zeros(B, 1, device=device)
-                
                 pred_v_v_0 = self.v_flow(x0_v, t_zero)
                 pred_v_o_0 = self.o_flow(x0_o, t_zero)
-                
-                pred_x1_v_0 = x0_v + 1.0 * pred_v_v_0
-                pred_x1_o_0 = x0_o + 1.0 * pred_v_o_0
                 
                 norm_v_v_0 = F.normalize(pred_v_v_0, dim=-1)
                 norm_v_o_0 = F.normalize(pred_v_o_0, dim=-1)
@@ -278,33 +294,14 @@ class CustomCLIP(nn.Module):
                 pred_v_c_0 = pred_a * norm_v_v_0 + pred_b * norm_v_o_0
                 pred_x1_c_0 = x0_c + 1.0 * pred_v_c_0
                 
-                # 【核心修复】：将 Flow 算出来的精准终点，重新喂回 C2C 去算 Logits
-                pred_x1_v_norm = F.normalize(pred_x1_v_0, dim=-1)
-                pred_x1_o_norm = F.normalize(pred_x1_o_0, dim=-1)
-                
-                logits_v = pred_x1_v_norm @ verb_text_features_norm.t()
-                logits_o = pred_x1_o_norm @ obj_text_features_norm.t()
-                
-                logits_v = logits_v * 0.5 + 0.5
-                logits_o = logits_o * 0.5 + 0.5
-                
-                # 【核心修复】：重新激活 C2C 的灵魂！让 Condition Module 继续发挥作用！
-                c = verb_text_features.shape[-1]
-                n_v = logits_v.shape[-1]
-                n_o = logits_o.shape[-1]
-
-                p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, B, c, n_v)
-                p_pair_o = p_v_con_o * logits_o.unsqueeze(1)
-                p_pair_v = p_o_con_v * logits_v.unsqueeze(-1)
-                
                 logits_c = None
                 if pairs is not None:
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
                     
-                    # 1. 拿回 C2C 最擅长的条件概率图 Logits
+                    # 1. 拿回纯净版 C2C 的条件概率图得分 (极其稳固的基线)
                     c2c_graph_logits = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
 
-                    # 2. 保留 FlowComposer 的显式直接 Logits
+                    # 2. 获取 FlowComposer 的空间测量得分
                     pair_verb_text = verb_text_features_norm[train_v_inds]
                     pair_obj_text = obj_text_features_norm[train_o_inds]
                     train_pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
@@ -313,11 +310,15 @@ class CustomCLIP(nn.Module):
                     flow_explicit_logits = pred_x1_c_norm @ train_pair_text_features.t()
                     flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
                     
-                    # 3. 强强联合！图推理兜底 + Flow对齐突破上限
+                    # 3. 完美结合！
                     logits_c = c2c_graph_logits + 0.5 * flow_explicit_logits
 
                 return {
-                    "logits_v": logits_v, "logits_o": logits_o, "logits_c": logits_c,
+                    # 【这里的返回至关重要】必须返回 base 版本的 logits 给 Loss_fn！
+                    "logits_v": logits_v_base, 
+                    "logits_o": logits_o_base, 
+                    "logits_c": logits_c,
+                    
                     "pred_v_v": pred_v_v_t, "pred_v_o": pred_v_o_t,
                     "true_v_v": target_x1_v - x0_v, "true_v_o": F.normalize(target_x1_o, dim=-1) - x0_o,
                     "pred_v_v_leak": pred_v_v_leak_t, "pred_v_o_leak": pred_v_o_leak_t,
@@ -329,13 +330,13 @@ class CustomCLIP(nn.Module):
                 }
 
             else:
+                # -------------------------------------------------------------
+                # 🚀 推理阶段：双流融合预测
+                # -------------------------------------------------------------
                 t_zero = torch.zeros(B, 1, device=device)
                 
                 pred_v_v = self.v_flow(x0_v, t_zero)
                 pred_v_o = self.o_flow(x0_o, t_zero)
-                
-                pred_x1_v_0 = x0_v + 1.0 * pred_v_v
-                pred_x1_o_0 = x0_o + 1.0 * pred_v_o
                 
                 norm_v_v = F.normalize(pred_v_v, dim=-1)
                 norm_v_o = F.normalize(pred_v_o, dim=-1)
@@ -344,27 +345,12 @@ class CustomCLIP(nn.Module):
                 pred_v_c = pred_a * norm_v_v + pred_b * norm_v_o
                 pred_x1_c_0 = x0_c + 1.0 * pred_v_c
                 
-                # 【推理阶段】：同样双端验证，C2C 过滤 + Flow 打分
-                pred_x1_v_norm = F.normalize(pred_x1_v_0, dim=-1)
-                pred_x1_o_norm = F.normalize(pred_x1_o_0, dim=-1)
-                
-                logits_v = pred_x1_v_norm @ verb_text_features_norm.t()
-                logits_o = pred_x1_o_norm @ obj_text_features_norm.t()
-                logits_v = logits_v * 0.5 + 0.5
-                logits_o = logits_o * 0.5 + 0.5
-                
-                c = verb_text_features.shape[-1]
-                n_v = logits_v.shape[-1]
-                n_o = logits_o.shape[-1]
-
-                p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, B, c, n_v)
-                p_pair_o = p_v_con_o * logits_o.unsqueeze(1)
-                p_pair_v = p_o_con_v * logits_v.unsqueeze(-1)
-                
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
                 
+                # 1. 基础 C2C 图得分 (使用没有污染的 p_pair_o 和 p_pair_v)
                 c2c_graph_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
                 
+                # 2. FlowComposer 得分
                 pair_verb_text = verb_text_features_norm[verb_idx]
                 pair_obj_text = obj_text_features_norm[obj_idx]
                 pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
@@ -373,6 +359,7 @@ class CustomCLIP(nn.Module):
                 flow_explicit_logits = pred_x1_c_norm @ pair_text_features.t()
                 flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
                 
+                # 3. 融合输出
                 com_logits = c2c_graph_logits + 0.5 * flow_explicit_logits
                 
                 return com_logits
