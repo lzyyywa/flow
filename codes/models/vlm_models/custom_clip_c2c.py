@@ -181,7 +181,6 @@ class CustomCLIP(nn.Module):
             self.o_flow = FlowMLP(cfg.emb_dim)
             self.composer = FlowComposer(cfg.emb_dim)
 
-
     def forward(self, video, pairs=None, verb_labels=None, obj_labels=None):
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
@@ -225,30 +224,26 @@ class CustomCLIP(nn.Module):
                 return com_logits
 
         # =========================================================
-        # === FlowComposer Plugin Branch (The True Two-Stream!) ===
+        # === FlowComposer (Pure Flow + Composer, No Leakage) =====
         # =========================================================
         else:
             B, D = v_feat.shape
             device = video.device
 
-            # 1. 基础特征提取与 L2 归一化
+            # L2 归一化的视觉起点和文本终点 (它们在超球面上)
             x0_v = F.normalize(v_feat, dim=-1)
             x0_o = F.normalize(o_feat, dim=-1)
 
             o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
             v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
-
             x0_c = F.normalize(v_feat_c + o_feat_c, dim=-1)
 
             verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
             obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
 
-            # -------------------------------------------------------------
-            # 🔥 主路：纯净 C2C 保底逻辑
-            # -------------------------------------------------------------
+            # --- C2C 原生图推演基线 ---
             logits_v_base = x0_v @ verb_text_features_norm.t()
             logits_o_base = x0_o @ obj_text_features_norm.t()
-
             logits_v_base = logits_v_base * 0.5 + 0.5
             logits_o_base = logits_o_base * 0.5 + 0.5
 
@@ -264,7 +259,7 @@ class CustomCLIP(nn.Module):
                 if verb_labels is None or obj_labels is None:
                     raise ValueError("Flow training requires `verb_labels` and `obj_labels`.")
 
-                # 🛡️ 【神级防御：.detach() 单向玻璃墙】
+                # 使用 .detach() 保护主干网络不被 Flow 产生的梯度干扰
                 x0_v_f = x0_v.detach()
                 x0_o_f = x0_o.detach()
                 x0_c_f = x0_c.detach()
@@ -272,7 +267,7 @@ class CustomCLIP(nn.Module):
                 target_x1_v = verb_text_features_norm[verb_labels]
                 target_x1_o = obj_text_features_norm[obj_labels]
 
-                # --- 辅路 A：流匹配 MSE 轨迹训练 ---
+                # --- Flow Matching 轨迹学习 (纯粹 MSE) ---
                 t = torch.rand(B, 1, device=device)
                 xt_v = (1 - t) * x0_v_f + t * target_x1_v
                 xt_o = (1 - t) * x0_o_f + t * target_x1_o
@@ -280,56 +275,39 @@ class CustomCLIP(nn.Module):
                 pred_v_v_t = self.v_flow(xt_v, t)
                 pred_v_o_t = self.o_flow(xt_o, t)
 
-                xt_v_leak = (1 - t) * x0_o_f + t * target_x1_v
-                xt_o_leak = (1 - t) * x0_v_f + t * target_x1_o
-
-                pred_v_v_leak_t = self.v_flow(xt_v_leak, t)
-                pred_v_o_leak_t = self.o_flow(xt_o_leak, t)
-
-                # --- 辅路 B：FlowComposer 辅助打分 ---
+                # --- 组合推演 Composer ---
                 t_zero = torch.zeros(B, 1, device=device)
                 pred_v_v_0 = self.v_flow(x0_v_f, t_zero)
                 pred_v_o_0 = self.o_flow(x0_o_f, t_zero)
 
-                norm_v_v_0 = F.normalize(pred_v_v_0, dim=-1)
-                norm_v_o_0 = F.normalize(pred_v_o_0, dim=-1)
-                pred_a, pred_b = self.composer(norm_v_v_0, norm_v_o_0)
+                # 输入给 Composer 时可以归一化以保证参数稳定
+                norm_v_v_in = F.normalize(pred_v_v_0, dim=-1)
+                norm_v_o_in = F.normalize(pred_v_o_0, dim=-1)
+                pred_a, pred_b = self.composer(norm_v_v_in, norm_v_o_in)
 
-                pred_v_c_0 = pred_a * norm_v_v_0 + pred_b * norm_v_o_0
+                # 【核心】：使用“原始速度向量”(不归一化)按比例组合，保持几何长度的物理意义
+                pred_v_c_0 = pred_a * pred_v_v_0 + pred_b * pred_v_o_0
                 pred_x1_c_0 = x0_c_f + 1.0 * pred_v_c_0
 
+                # 训练时，完全不用交叉熵惩罚 Flow 模块，让其纯净生长
                 logits_c = None
-                logits_c_flow = None # 单独存放 Flow 的得分
-
                 if pairs is not None:
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
-
-                    c2c_graph_logits = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
-
-                    pair_verb_text = verb_text_features_norm[train_v_inds]
-                    pair_obj_text = obj_text_features_norm[train_o_inds]
-                    train_pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
-
-                    pred_x1_c_norm = F.normalize(pred_x1_c_0, dim=-1)
-                    flow_explicit_logits = pred_x1_c_norm @ train_pair_text_features.t()
-                    flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
-
-                    # 【彻底分离】：将 C2C 地基分数和 Flow 对比分数单独输出，互不干扰！
-                    logits_c = c2c_graph_logits
-                    logits_c_flow = flow_explicit_logits
+                    logits_c = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
 
                 return {
                     "logits_v": logits_v_base,
                     "logits_o": logits_o_base,
                     "logits_c": logits_c,
-                    "logits_c_flow": logits_c_flow, # 独立返回供训练计算 Loss
-                    
+
                     "pred_v_v": pred_v_v_t, "pred_v_o": pred_v_o_t,
+                    # 真实速度 Target
                     "true_v_v": target_x1_v - x0_v_f, "true_v_o": target_x1_o - x0_o_f,
-                    "pred_v_v_leak": pred_v_v_leak_t, "pred_v_o_leak": pred_v_o_leak_t,
-                    "true_v_v_leak": target_x1_v - x0_o_f, "true_v_o_leak": target_x1_o - x0_v_f,
+                    
                     "pred_a": pred_a, "pred_b": pred_b,
-                    "norm_v_v": norm_v_v_0, "norm_v_o": norm_v_o_0,
+                    # 输出原始速度给 train_models.py 做系数岭回归
+                    "raw_v_v_0": pred_v_v_0, "raw_v_o_0": pred_v_o_0,
+                    # 组合特征的目标差向量
                     "true_v_c": F.normalize(target_x1_v + target_x1_o, dim=-1) - x0_c_f,
                     "logit_scale": self.logit_scale
                 }
@@ -341,25 +319,27 @@ class CustomCLIP(nn.Module):
                 pred_v_v = self.v_flow(x0_v, t_zero)
                 pred_v_o = self.o_flow(x0_o, t_zero)
 
-                norm_v_v = F.normalize(pred_v_v, dim=-1)
-                norm_v_o = F.normalize(pred_v_o, dim=-1)
-                pred_a, pred_b = self.composer(norm_v_v, norm_v_o)
+                norm_v_v_in = F.normalize(pred_v_v, dim=-1)
+                norm_v_o_in = F.normalize(pred_v_o, dim=-1)
+                pred_a, pred_b = self.composer(norm_v_v_in, norm_v_o_in)
 
-                pred_v_c = pred_a * norm_v_v + pred_b * norm_v_o
+                # 同样使用原始速度！
+                pred_v_c = pred_a * pred_v_v + pred_b * pred_v_o
                 pred_x1_c_0 = x0_c + 1.0 * pred_v_c
 
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-
                 c2c_graph_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
 
                 pair_verb_text = verb_text_features_norm[verb_idx]
                 pair_obj_text = obj_text_features_norm[obj_idx]
                 pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
 
+                # 在距离空间对比推演结果和文本特征
                 pred_x1_c_norm = F.normalize(pred_x1_c_0, dim=-1)
                 flow_explicit_logits = pred_x1_c_norm @ pair_text_features.t()
                 flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
 
+                # 强强联合推断
                 com_logits = c2c_graph_logits + 0.5 * flow_explicit_logits
 
                 return com_logits
