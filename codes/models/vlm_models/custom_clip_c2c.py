@@ -138,7 +138,6 @@ class CustomCLIP(nn.Module):
 
         self.use_flow = getattr(cfg, 'use_flow', False)
         if self.use_flow:
-            # 最纯净版的投影，只用原本的 300 维特征
             self.flow_v_proj = nn.Linear(cfg.emb_dim, cfg.feat_dim)
             self.flow_o_proj = nn.Linear(cfg.emb_dim, cfg.feat_dim)
             self.flow_c_proj = nn.Linear(cfg.feat_dim, cfg.feat_dim)
@@ -202,14 +201,13 @@ class CustomCLIP(nn.Module):
             p_pair_v = p_o_con_v * logits_v_base.unsqueeze(-1)
 
             if self.training:
-                # 隔离保护
+                # 隔离保护：绝对的护城河，让 Flow 自己学桥梁，不摧毁基座！
                 v_feat_d = v_feat.detach()
                 o_feat_d = o_feat.detach()
                 vid_feat_d = vid_feat.detach()
                 raw_v_text_d = raw_verb_text_features.detach()
                 raw_o_text_d = raw_obj_text_features.detach()
 
-                # 纯特征直接投影，不做拼接
                 x0_v_flow = F.normalize(self.flow_v_proj(v_feat_d), dim=-1)
                 x0_o_flow = F.normalize(self.flow_o_proj(o_feat_d), dim=-1)
                 x0_c_flow = F.normalize(self.flow_c_proj(vid_feat_d), dim=-1)
@@ -226,21 +224,21 @@ class CustomCLIP(nn.Module):
                 pred_v_v_t = self.v_flow(xt_v, t)
                 pred_v_o_t = self.o_flow(xt_o, t)
 
-                # 正统推演落脚点
                 pred_x1_v = xt_v + (1 - t) * pred_v_v_t
                 pred_x1_o = xt_o + (1 - t) * pred_v_o_t
 
-                # Composer 计算
-                delta_v_t = F.normalize(pred_v_v_t, dim=-1)
-                delta_o_t = F.normalize(pred_v_o_t, dim=-1)
+                # 获取此时真正的轨迹输出，不再需要 F.normalize
+                # 只有保留原始模长，网络才能拟合真正的“直线距离”
+                delta_v_t = pred_v_v_t
+                delta_o_t = pred_v_o_t
                 pred_a, pred_b = self.composer(delta_v_t, delta_o_t)
 
                 t_zero = torch.zeros(B, 1, device=device)
                 pred_v_v_0 = self.v_flow(x0_v_flow, t_zero)
                 pred_v_o_0 = self.o_flow(x0_o_flow, t_zero)
                 
-                delta_v_0 = F.normalize(pred_v_v_0, dim=-1)
-                delta_o_0 = F.normalize(pred_v_o_0, dim=-1)
+                delta_v_0 = pred_v_v_0
+                delta_o_0 = pred_v_o_0
                 a_0, b_0 = self.composer(delta_v_0, delta_o_0)
                 
                 pred_v_c_0 = a_0 * delta_v_0 + b_0 * delta_o_0
@@ -255,7 +253,6 @@ class CustomCLIP(nn.Module):
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
                     logits_c = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
 
-                    # 纯净的 Cosine 打分
                     logits_v_flow = F.normalize(pred_x1_v, dim=-1) @ e_v.t()
                     logits_o_flow = F.normalize(pred_x1_o, dim=-1) @ e_o.t()
 
@@ -264,16 +261,19 @@ class CustomCLIP(nn.Module):
 
                 target_x1_c = None
                 if verb_labels is not None and obj_labels is not None:
-                    target_x1_c = e_v[verb_labels] + e_o[obj_labels]
+                    target_x1_c = F.normalize(e_v[verb_labels] + e_o[obj_labels], dim=-1)
 
                 return {
                     "logits_v": logits_v_base, "logits_o": logits_o_base, "logits_c": logits_c,
                     "logits_v_flow": logits_v_flow, "logits_o_flow": logits_o_flow, "logits_c_flow": logits_c_flow,
                     "pred_v_v": pred_v_v_t, "pred_v_o": pred_v_o_t,
-                    "true_v_v": target_x1_v - x0_v_flow, "true_v_o": target_x1_o - x0_o_flow,
+                    # 真实速度 Target
+                    "true_v_v": target_x1_v - x0_v_flow.detach(), 
+                    "true_v_o": target_x1_o - x0_o_flow.detach(),
                     "pred_a": pred_a, "pred_b": pred_b,
                     "raw_v_v_t": pred_v_v_t, "raw_v_o_t": pred_v_o_t,
-                    "true_v_c": target_x1_c - x0_c_flow, 
+                    "raw_v_v_0": pred_v_v_0, "raw_v_o_0": pred_v_o_0,
+                    "true_v_c": target_x1_c - x0_c_flow.detach(), 
                     "pred_x1_c_0": pred_x1_c_0, "target_x1_c": target_x1_c,
                     "logit_scale": self.logit_scale
                 }
@@ -281,7 +281,6 @@ class CustomCLIP(nn.Module):
             else:
                 t_zero = torch.zeros(B, 1, device=device)
 
-                # 测试时也只用纯特征投影
                 x0_v_flow = F.normalize(self.flow_v_proj(v_feat), dim=-1)
                 x0_o_flow = F.normalize(self.flow_o_proj(o_feat), dim=-1)
                 x0_c_flow = F.normalize(self.flow_c_proj(vid_feat), dim=-1)
@@ -292,8 +291,8 @@ class CustomCLIP(nn.Module):
                 pred_v_v = self.v_flow(x0_v_flow, t_zero)
                 pred_v_o = self.o_flow(x0_o_flow, t_zero)
 
-                delta_v_0 = F.normalize(pred_v_v, dim=-1)
-                delta_o_0 = F.normalize(pred_v_o, dim=-1)
+                delta_v_0 = pred_v_v
+                delta_o_0 = pred_v_o
                 pred_a, pred_b = self.composer(delta_v_0, delta_o_0)
 
                 pred_v_c = pred_a * delta_v_0 + pred_b * delta_o_0
@@ -307,7 +306,9 @@ class CustomCLIP(nn.Module):
                 pair_text_features_raw = pair_verb_text_raw + pair_obj_text_raw
 
                 flow_explicit_logits = F.normalize(pred_x1_c_0, dim=-1) @ F.normalize(pair_text_features_raw, dim=-1).t() * 0.5 + 0.5
-                com_logits = c2c_graph_logits + 0.5 * flow_explicit_logits
+                
+                # 【强权赋予】：让 Flow 以 1.0 的比例发挥作用，打破扁平分布！
+                com_logits = c2c_graph_logits + 1.0 * flow_explicit_logits
                 return com_logits
 
     def condition_module(self, v_feat_c, o_feat_c, v_emb, o_emb, n_o, b, c, n_v):
