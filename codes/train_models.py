@@ -63,12 +63,12 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
     for i in range(config.epoch_start, config.epochs):
         progress_bar = tqdm.tqdm(total=len(train_dataloader), desc="epoch % 3d" % (i + 1))
-        
+
         epoch_train_losses = []
         epoch_com_losses = []
         epoch_mse_losses = []
         epoch_comp_losses = []
-        epoch_flow_ce_losses = [] 
+        epoch_flow_ce_losses = []
 
         use_flow = getattr(config, 'use_flow', False)
         temp_lr = optimizer.param_groups[-1]['lr']
@@ -95,15 +95,15 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
                     total_flow_ce = loss_v_flow + loss_o_flow + loss_c_flow
 
-                    # 【核心修复 1】：打破扁平化陷阱！使用 sum 恢复真实向量距离
+                    # 打破扁平化陷阱！使用 sum 恢复真实向量距离
                     loss_mse_total = torch.mean(torch.sum((outputs["pred_v_v"] - outputs["true_v_v"])**2, dim=-1)) + \
                                      torch.mean(torch.sum((outputs["pred_v_o"] - outputs["true_v_o"])**2, dim=-1))
 
                     with torch.no_grad():
-                        delta_v_t = F.normalize(outputs["raw_v_v_0"], dim=-1)
-                        delta_o_t = F.normalize(outputs["raw_v_o_0"], dim=-1)
+                        delta_v_0 = F.normalize(outputs["raw_v_v_0"], dim=-1)
+                        delta_o_0 = F.normalize(outputs["raw_v_o_0"], dim=-1)
 
-                        A = torch.stack([delta_v_t, delta_o_t], dim=-1).float()
+                        A = torch.stack([delta_v_0, delta_o_0], dim=-1).float()
                         B_target = outputs["true_v_c"].unsqueeze(-1).float()
 
                         A_t = A.transpose(-2, -1)
@@ -120,18 +120,20 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
                     loss_comp = F.mse_loss(outputs["pred_a"], a_star) + F.mse_loss(outputs["pred_b"], b_star)
 
-                    # 【核心修复 2】：终点 MSE 锁死，同样需要恢复量级！
+                    # 终点 MSE 锁死，同样需要恢复量级！
                     pred_x1_norm = F.normalize(outputs["pred_x1_c_0"], dim=-1)
                     target_x1_norm = F.normalize(outputs["target_x1_c"], dim=-1)
                     loss_endpoint_mse = torch.mean(torch.sum((pred_x1_norm - target_x1_norm)**2, dim=-1))
 
                     flow_weight = getattr(config, 'flow_loss_weight', 1.0)
                     comp_weight = getattr(config, 'composer_weight', 1.0)
+
+                    # 恢复跑出 0.2442 的经典配置 0.5，不要去手动改成 1.0
                     flow_ce_weight = getattr(config, 'flow_ce_weight', 0.5)
 
                     loss = loss_com + 0.2 * (loss_verb + loss_obj) + \
                            flow_weight * loss_mse_total + comp_weight * loss_comp + \
-                           flow_ce_weight * total_flow_ce + 1.0 * loss_endpoint_mse
+                          flow_ce_weight * total_flow_ce + 1.0 * loss_endpoint_mse
 
                     mse_loss_val = loss_mse_total.item()
                     comp_loss_val = loss_comp.item()
